@@ -10,6 +10,10 @@ Metrics:
   - LoadAverage
   - NetworkConnections
 
+Each metric is reported with respect to both the instance id and the
+image id, the latter providing aggregate numbers for all instances
+running that image (e.g. auto-scale groups).
+
 To authenticate, either provide machines with an IAM role or set
 environment variables ``AWS_ACCESS_KEY_ID`` and
 ``AWS_SECRET_ACCESS_KEY``. If an IAM role is provided, usually no

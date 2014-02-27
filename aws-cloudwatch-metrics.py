@@ -233,6 +233,10 @@ def request_instance_id():
     return request_metadata('instance-id')
 
 
+def request_ami_id():
+    return request_metadata('ami-id')
+
+
 def request_region():
     return request_metadata('placement/availability-zone')[:-1]
 
@@ -269,7 +273,7 @@ def get_secure_connection(host, **options):
     return conn
 
 
-def submit_metrics(data):
+def submit_metrics(data, *dimensions):
     conn = get_secure_connection(host, timeout=5)
 
     query = {
@@ -279,17 +283,17 @@ def submit_metrics(data):
     }
 
     i = 0
-    for name, (value, unit, dimensions) in data:
+    for name, (value, unit, metric_dimensions) in data:
         i += 1
         prefix = 'MetricData.member.%d.' % i
         query[prefix + 'MetricName'] = name
         query[prefix + 'Unit'] = unit
         query[prefix + 'Value'] = value
-        query[prefix + 'Dimensions.member.1.Name'] = 'InstanceId'
-        query[prefix + 'Dimensions.member.1.Value'] = instance_id
 
-        for j, (name, value) in enumerate(dimensions):
-            dimension = prefix + 'Dimensions.member.%d.' % (j + 2)
+        metric_dimensions = tuple(metric_dimensions)
+
+        for j, (name, value) in enumerate(dimensions + metric_dimensions):
+            dimension = prefix + 'Dimensions.member.%d.' % (j + 1)
             query[dimension + 'Name'] = name
             query[dimension + 'Value'] = value
 
@@ -319,7 +323,7 @@ def collect_metrics():
             )
 
             inactive = (memfree + buffers + cached) / float(memtotal)
-            yield round(100 * (1 - inactive), 1), "Percent", []
+            yield round(100 * (1 - inactive), 1), "Percent", ()
 
     @collect
     def disk_space_utilization():
@@ -332,17 +336,17 @@ def collect_metrics():
                 result = statvfs(path)
 
                 free = result.f_bfree / float(result.f_blocks)
-                yield round(100 * (1 - free), 1), "Percent", [
+                yield round(100 * (1 - free), 1), "Percent", (
                     ("Filesystem", filesystem),
                     ("MountPath", path)
-                ]
+                )
 
     @collect
     def load_average():
         with open('/proc/loadavg') as f:
             line = f.read()
             load = float(line.split(' ', 1)[0])
-            yield round(100 * load, 1), "Percent", []
+            yield round(100 * load, 1), "Percent", ()
 
     @collect
     def network_connections():
@@ -350,13 +354,13 @@ def collect_metrics():
             for i, line in enumerate(f):
                 pass
 
-        yield i, "Count", [("Protocol", "TCP")]
+        yield i, "Count", (("Protocol", "TCP"), )
 
         with open('/proc/net/udp') as f:
             for i, line in enumerate(f):
                 pass
 
-        yield i, "Count", [("Protocol", "UDP")]
+        yield i, "Count", (("Protocol", "UDP"), )
 
     return data
 
@@ -366,11 +370,13 @@ try:
     access_key = environ.get('AWS_ACCESS_KEY_ID') or request_access_key()
     secret_key = environ.get('AWS_SECRET_ACCESS_KEY') or request_secret_key()
     instance_id = environ.get('AWS_INSTANCE_ID') or request_instance_id()
+    ami_id = environ.get('AWS_AMI_ID') or request_ami_id()
     region = environ.get('AWS_REGION') or request_region()
     host = "%s.%s.amazonaws.com" % (service, region)
 
     data = collect_metrics()
-    submit_metrics(data)
+    for dimension in (('InstanceId', instance_id), ('ImageId', ami_id)):
+        submit_metrics(data, dimension)
 except BaseException:
     log(traceback.format_exc())
     raise SystemExit(1)
