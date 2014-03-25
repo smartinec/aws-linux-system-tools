@@ -17,10 +17,11 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import re
+import argparse
 import traceback
 
 from os import environ, statvfs
-from sys import argv, stderr, version
+from sys import stderr, version
 from json import loads
 from hmac import new as hmac
 from datetime import datetime
@@ -74,8 +75,10 @@ def cached(f):
     return decorator
 
 
-def log(message, stream=stderr):
-    return stream.write("Error: " + message.__str__() + '\n')
+def log(message, status="error", stream=stderr):
+    return stream.write(
+        "%s: %s\n" % (status.capitalize(), message.__str__())
+    )
 
 
 def pick(iterable, g, *args):
@@ -374,24 +377,32 @@ ami_id = environ.get('AWS_AMI_ID') or request_ami_id()
 region = environ.get('AWS_REGION') or request_region()
 
 
-if __name__ == '__main__':
-    command = None
-    for arg in argv[1:]:
-        if arg.isalpha():
-            command = arg
-
-    if command is None:
-        raise SystemExit(
-            "%s: missing operand.\nTry 'metrics'." %
-            argv[0]
+def metrics(verbose):
+    verbose and log("collecting metrics ...", "info")
+    data = collect_metrics()
+    verbose and log("%d metrics collected." % len(data), "info")
+    dimensions = ('InstanceId', instance_id), ('ImageId', ami_id)
+    for dimension in dimensions:
+        verbose and log(
+            "submit metrics for dimension '%s' ..." % dimension[0], "info"
         )
+        submit_metrics(data, dimension)
 
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--verbose', '-v', action='store_true')
+    commands = parser.add_subparsers()
+    commands.add_parser('metrics', help='report system metrics').set_defaults(
+        func=metrics
+    )
+
+    args = parser.parse_args()
+    args.verbose and log("command '%s' ..." % args.func.__name__, "info")
     try:
-        if command == 'metrics':
-            data = collect_metrics()
-            dimensions = ('InstanceId', instance_id), ('ImageId', ami_id)
-            for dimension in dimensions:
-                submit_metrics(data, dimension)
+        args.func(args.verbose)
     except BaseException:
         log(traceback.format_exc())
         raise SystemExit(1)
+    else:
+        args.verbose and log("done.", "info")
