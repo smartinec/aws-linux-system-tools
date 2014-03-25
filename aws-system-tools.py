@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# AWS CloudWatch Linux Metrics
+# AWS Linux System Tools
 # Copyright 2014 Birdback Ltd. All Rights Reserved.
 #
 # This program is free software: you can redistribute it and/or modify
@@ -20,7 +20,7 @@ import re
 import traceback
 
 from os import environ, statvfs
-from sys import stderr, version
+from sys import argv, stderr, version
 from json import loads
 from hmac import new as hmac
 from datetime import datetime
@@ -44,7 +44,6 @@ canonical_time_format = "%Y%m%dT%H%M%SZ"
 encoding = "utf-8"
 method = "POST"
 path = "/"
-service = "monitoring"
 auth_type = "aws4_request"
 now = datetime.utcnow()
 namespace = "System/Linux"
@@ -114,7 +113,7 @@ def get_digest(string):
     return sha256(bytes(string)).hexdigest().__str__()
 
 
-def get_string_to_sign(canonical):
+def get_string_to_sign(service, canonical):
     digest = get_digest(canonical)
     return "\n".join((
         "AWS4-HMAC-SHA256",
@@ -136,7 +135,10 @@ def get_signature(*args):
     return str(hexlify(s))
 
 
-def make_request(conn, body):
+def make_request(service, body):
+    host = "%s.%s.amazonaws.com" % (service, region)
+    conn = get_secure_connection(host, timeout=5)
+
     headers = {
         "Content-type": "application/x-www-form-urlencoded; charset=%s" % (
             encoding,
@@ -155,7 +157,7 @@ def make_request(conn, body):
         region,
         service,
         auth_type,
-        get_string_to_sign(canonical),
+        get_string_to_sign(service, canonical),
     )
 
     headers.update({
@@ -274,8 +276,6 @@ def get_secure_connection(host, **options):
 
 
 def submit_metrics(data, *dimensions):
-    conn = get_secure_connection(host, timeout=5)
-
     query = {
         "Action": "PutMetricData",
         "Version": "2010-08-01",
@@ -298,7 +298,7 @@ def submit_metrics(data, *dimensions):
             query[dimension + 'Value'] = value
 
     body = urlencode(query)
-    return make_request(conn, body)
+    return make_request("monitoring", body)
 
 
 def collect_metrics():
@@ -365,18 +365,33 @@ def collect_metrics():
     return data
 
 
-try:
-    security_token = None
-    access_key = environ.get('AWS_ACCESS_KEY_ID') or request_access_key()
-    secret_key = environ.get('AWS_SECRET_ACCESS_KEY') or request_secret_key()
-    instance_id = environ.get('AWS_INSTANCE_ID') or request_instance_id()
-    ami_id = environ.get('AWS_AMI_ID') or request_ami_id()
-    region = environ.get('AWS_REGION') or request_region()
-    host = "%s.%s.amazonaws.com" % (service, region)
+# The following configuration is pulled automatically if not provided.
+security_token = None
+access_key = environ.get('AWS_ACCESS_KEY_ID') or request_access_key()
+secret_key = environ.get('AWS_SECRET_ACCESS_KEY') or request_secret_key()
+instance_id = environ.get('AWS_INSTANCE_ID') or request_instance_id()
+ami_id = environ.get('AWS_AMI_ID') or request_ami_id()
+region = environ.get('AWS_REGION') or request_region()
 
-    data = collect_metrics()
-    for dimension in (('InstanceId', instance_id), ('ImageId', ami_id)):
-        submit_metrics(data, dimension)
-except BaseException:
-    log(traceback.format_exc())
-    raise SystemExit(1)
+
+if __name__ == '__main__':
+    command = None
+    for arg in argv[1:]:
+        if arg.isalpha():
+            command = arg
+
+    if command is None:
+        raise SystemExit(
+            "%s: missing operand.\nTry 'metrics'." %
+            argv[0]
+        )
+
+    try:
+        if command == 'metrics':
+            data = collect_metrics()
+            dimensions = ('InstanceId', instance_id), ('ImageId', ami_id)
+            for dimension in dimensions:
+                submit_metrics(data, dimension)
+    except BaseException:
+        log(traceback.format_exc())
+        raise SystemExit(1)
