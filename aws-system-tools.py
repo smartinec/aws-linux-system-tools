@@ -48,9 +48,15 @@ path = "/"
 auth_type = "aws4_request"
 now = datetime.utcnow()
 namespace = "System/Linux"
-metric_name_regex = re.compile(r'(?:^|_)([a-z])')
+camelcase_regex = re.compile(r'(?:^|_)([a-z])')
 meminfo_regex = re.compile(r'([A-Z][A-Za-z()_]+):\s+(\d+)(?: ([km]B))')
-
+snapshot_regex = re.compile(r'<snapshotId>(snap-[0-9a-f]+)</snapshotId>')
+volumes_regex = re.compile(
+    r'<volumeId>(vol-[0-9a-f]+)</volumeId>\s*'
+    r'<instanceId>(i-[0-9a-f]+)</instanceId>\s*'
+    r'<device>((?:/[a-z]\w+)+)</device>\s*'
+    r'<status>attached</status>'
+)
 
 if version[0] == '3':
     def bytes(s, str=str):
@@ -91,6 +97,10 @@ def pick(iterable, g, *args):
                 break
 
     return vs
+
+
+def camelcase(name):
+    return camelcase_regex.sub(lambda s: s.group(1).upper(), name)
 
 
 def get_canonical(body, headers):
@@ -278,6 +288,12 @@ def get_secure_connection(host, **options):
     return conn
 
 
+def ec2(action, **params):
+    params = dict((camelcase(name), value) for (name, value) in params.items())
+    params.update({"Action": action, "Version": "2013-07-15"})
+    return make_request("ec2", urlencode(params))
+
+
 def submit_metrics(data, *dimensions):
     query = {
         "Action": "PutMetricData",
@@ -308,7 +324,7 @@ def collect_metrics():
     data = []
 
     def collect(f):
-        name = metric_name_regex.sub(lambda s: s.group(1).upper(), f.__name__)
+        name = camelcase(f.__name__)
         for value in f():
             data.append((name, value))
 
@@ -389,12 +405,39 @@ def metrics(verbose):
         submit_metrics(data, dimension)
 
 
+def snapshot(verbose):
+    verbose and log("getting list of logically attached volumes ...", "info")
+    data = ec2("DescribeVolumes")
+
+    for volume_id, current_instance_id, dev in volumes_regex.findall(data):
+        if current_instance_id != instance_id:
+            continue
+
+        verbose and log("volume %s attached to device: %s." % (
+            volume_id, dev), "info")
+
+        data = ec2(
+            "CreateSnapshot",
+            volume_id=volume_id,
+            description="Automated snapshot for %s from %s" % (
+                instance_id, volume_id
+            )
+        )
+
+        if verbose:
+            for snapshot_id in snapshot_regex.findall(data):
+                log("snapshot %s created." % snapshot_id, "info")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='store_true')
     commands = parser.add_subparsers()
     commands.add_parser('metrics', help='report system metrics').set_defaults(
         func=metrics
+    )
+    commands.add_parser('snapshot', help='create snapshot').set_defaults(
+        func=snapshot
     )
 
     args = parser.parse_args()

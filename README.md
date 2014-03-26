@@ -40,3 +40,12 @@ Metrics:
 Each metric is reported with respect to both the instance id and the
 image id, the latter providing aggregate numbers for all instances
 running that image (e.g. auto-scale groups).
+
+
+EBS Snapshots
+-------------
+
+The ``snapshot`` command requests an EBS snapshot of those volumes
+currently attached logically to the machine.
+
+    $ python aws-system-tools.py snapshot
