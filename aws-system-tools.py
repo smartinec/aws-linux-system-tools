@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# AWS CloudWatch Linux Metrics
+# AWS Linux System Tools
 # Copyright 2014 Birdback Ltd. All Rights Reserved.
 #
 # This program is free software: you can redistribute it and/or modify
@@ -17,6 +17,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import re
+import argparse
 import traceback
 
 from os import environ, statvfs
@@ -44,13 +45,18 @@ canonical_time_format = "%Y%m%dT%H%M%SZ"
 encoding = "utf-8"
 method = "POST"
 path = "/"
-service = "monitoring"
 auth_type = "aws4_request"
 now = datetime.utcnow()
 namespace = "System/Linux"
-metric_name_regex = re.compile(r'(?:^|_)([a-z])')
+camelcase_regex = re.compile(r'(?:^|_)([a-z])')
 meminfo_regex = re.compile(r'([A-Z][A-Za-z()_]+):\s+(\d+)(?: ([km]B))')
-
+snapshot_regex = re.compile(r'<snapshotId>(snap-[0-9a-f]+)</snapshotId>')
+volumes_regex = re.compile(
+    r'<volumeId>(vol-[0-9a-f]+)</volumeId>\s*'
+    r'<instanceId>(i-[0-9a-f]+)</instanceId>\s*'
+    r'<device>((?:/[a-z]\w+)+)</device>\s*'
+    r'<status>attached</status>'
+)
 
 if version[0] == '3':
     def bytes(s, str=str):
@@ -75,8 +81,10 @@ def cached(f):
     return decorator
 
 
-def log(message, stream=stderr):
-    return stream.write("Error: " + message.__str__() + '\n')
+def log(message, status="error", stream=stderr):
+    return stream.write(
+        "%s: %s\n" % (status.capitalize(), message.__str__())
+    )
 
 
 def pick(iterable, g, *args):
@@ -89,6 +97,10 @@ def pick(iterable, g, *args):
                 break
 
     return vs
+
+
+def camelcase(name):
+    return camelcase_regex.sub(lambda s: s.group(1).upper(), name)
 
 
 def get_canonical(body, headers):
@@ -114,7 +126,7 @@ def get_digest(string):
     return sha256(bytes(string)).hexdigest().__str__()
 
 
-def get_string_to_sign(canonical):
+def get_string_to_sign(service, canonical):
     digest = get_digest(canonical)
     return "\n".join((
         "AWS4-HMAC-SHA256",
@@ -136,7 +148,10 @@ def get_signature(*args):
     return str(hexlify(s))
 
 
-def make_request(conn, body):
+def make_request(service, body):
+    host = "%s.%s.amazonaws.com" % (service, region)
+    conn = get_secure_connection(host, timeout=5)
+
     headers = {
         "Content-type": "application/x-www-form-urlencoded; charset=%s" % (
             encoding,
@@ -155,7 +170,7 @@ def make_request(conn, body):
         region,
         service,
         auth_type,
-        get_string_to_sign(canonical),
+        get_string_to_sign(service, canonical),
     )
 
     headers.update({
@@ -273,9 +288,13 @@ def get_secure_connection(host, **options):
     return conn
 
 
-def submit_metrics(data, *dimensions):
-    conn = get_secure_connection(host, timeout=5)
+def ec2(action, **params):
+    params = dict((camelcase(name), value) for (name, value) in params.items())
+    params.update({"Action": action, "Version": "2013-07-15"})
+    return make_request("ec2", urlencode(params))
 
+
+def submit_metrics(data, *dimensions):
     query = {
         "Action": "PutMetricData",
         "Version": "2010-08-01",
@@ -298,14 +317,14 @@ def submit_metrics(data, *dimensions):
             query[dimension + 'Value'] = value
 
     body = urlencode(query)
-    return make_request(conn, body)
+    return make_request("monitoring", body)
 
 
 def collect_metrics():
     data = []
 
     def collect(f):
-        name = metric_name_regex.sub(lambda s: s.group(1).upper(), f.__name__)
+        name = camelcase(f.__name__)
         for value in f():
             data.append((name, value))
 
@@ -365,18 +384,68 @@ def collect_metrics():
     return data
 
 
-try:
-    security_token = None
-    access_key = environ.get('AWS_ACCESS_KEY_ID') or request_access_key()
-    secret_key = environ.get('AWS_SECRET_ACCESS_KEY') or request_secret_key()
-    instance_id = environ.get('AWS_INSTANCE_ID') or request_instance_id()
-    ami_id = environ.get('AWS_AMI_ID') or request_ami_id()
-    region = environ.get('AWS_REGION') or request_region()
-    host = "%s.%s.amazonaws.com" % (service, region)
+# The following configuration is pulled automatically if not provided.
+security_token = None
+access_key = environ.get('AWS_ACCESS_KEY_ID') or request_access_key()
+secret_key = environ.get('AWS_SECRET_ACCESS_KEY') or request_secret_key()
+instance_id = environ.get('AWS_INSTANCE_ID') or request_instance_id()
+ami_id = environ.get('AWS_AMI_ID') or request_ami_id()
+region = environ.get('AWS_REGION') or request_region()
 
+
+def metrics(verbose):
+    verbose and log("collecting metrics ...", "info")
     data = collect_metrics()
-    for dimension in (('InstanceId', instance_id), ('ImageId', ami_id)):
+    verbose and log("%d metrics collected." % len(data), "info")
+    dimensions = ('InstanceId', instance_id), ('ImageId', ami_id)
+    for dimension in dimensions:
+        verbose and log(
+            "submit metrics for dimension '%s' ..." % dimension[0], "info"
+        )
         submit_metrics(data, dimension)
-except BaseException:
-    log(traceback.format_exc())
-    raise SystemExit(1)
+
+
+def snapshot(verbose):
+    verbose and log("getting list of logically attached volumes ...", "info")
+    data = ec2("DescribeVolumes")
+
+    for volume_id, current_instance_id, dev in volumes_regex.findall(data):
+        if current_instance_id != instance_id:
+            continue
+
+        verbose and log("volume %s attached to device: %s." % (
+            volume_id, dev), "info")
+
+        data = ec2(
+            "CreateSnapshot",
+            volume_id=volume_id,
+            description="Automated snapshot for %s from %s" % (
+                instance_id, volume_id
+            )
+        )
+
+        if verbose:
+            for snapshot_id in snapshot_regex.findall(data):
+                log("snapshot %s created." % snapshot_id, "info")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--verbose', '-v', action='store_true')
+    commands = parser.add_subparsers()
+    commands.add_parser('metrics', help='report system metrics').set_defaults(
+        func=metrics
+    )
+    commands.add_parser('snapshot', help='create snapshot').set_defaults(
+        func=snapshot
+    )
+
+    args = parser.parse_args()
+    args.verbose and log("command '%s' ..." % args.func.__name__, "info")
+    try:
+        args.func(args.verbose)
+    except BaseException:
+        log(traceback.format_exc())
+        raise SystemExit(1)
+    else:
+        args.verbose and log("done.", "info")
