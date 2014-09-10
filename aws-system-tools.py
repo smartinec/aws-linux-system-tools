@@ -411,10 +411,6 @@ def collect_metrics(statfile=None):
             yield stats[2], "Percent", ()
 
         @collect
-        def idle():
-            yield stats[3], "Percent", ()
-
-        @collect
         def blocked():
             yield stats[4], "Percent", ()
 

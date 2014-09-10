@@ -43,12 +43,10 @@ are reported:
   - User:    Normal processes executing in user mode
   - Nice:    Niced processes executing in user mode
   - System:  Processes executing in kernel mode
-  - Idle:    Twiddling thumbs
   - Blocked: Waiting for I/O to complete
   - Irq:     Servicing interrupts
   - SoftIrq: Servicing softirqs
   - Steal:   Virtual CPU steal
-
 
 Each metric is reported with respect to both the instance id and the
 image id, the latter providing aggregate numbers for all instances
