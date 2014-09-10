@@ -16,11 +16,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import os
 import re
 import argparse
 import traceback
 
-from os import environ, statvfs
+from operator import sub
 from sys import stderr, version
 from json import loads
 from hmac import new as hmac
@@ -257,7 +258,7 @@ def request_region():
 
 
 def get_proxy(name):
-    value = environ.get(name) or environ.get(name.upper())
+    value = os.environ.get(name) or os.environ.get(name.upper())
     if value is None:
         return
 
@@ -294,6 +295,12 @@ def ec2(action, **params):
     return make_request("ec2", urlencode(params))
 
 
+def read_stats(data):
+    if not data:
+        return
+    return tuple(map(float, filter(None, re.split('\s+', data)[1:])))
+
+
 def submit_metrics(data, *dimensions):
     query = {
         "Action": "PutMetricData",
@@ -320,7 +327,12 @@ def submit_metrics(data, *dimensions):
     return make_request("monitoring", body)
 
 
-def collect_metrics():
+def touchopen(filename, *args, **kwargs):
+    fd = os.open(filename, os.O_RDWR | os.O_CREAT)
+    return os.fdopen(fd, *args, **kwargs)
+
+
+def collect_metrics(statfile=None):
     data = []
 
     def collect(f):
@@ -352,7 +364,7 @@ def collect_metrics():
                     continue
 
                 device, path, filesystem, options = line.split(' ', 3)
-                result = statvfs(path)
+                result = os.statvfs(path)
 
                 free = result.f_bfree / float(result.f_blocks)
                 yield round(100 * (1 - free), 1), "Percent", (
@@ -366,6 +378,59 @@ def collect_metrics():
             line = f.read()
             load = float(line.split(' ', 1)[0])
             yield round(100 * load, 1), "Percent", ()
+
+    if statfile is not None:
+        with open('/proc/stat') as f, touchopen(statfile, 'r+') as g:
+            new = f.readline()
+            old = g.readline()
+
+            g.seek(0)
+            g.write(new)
+            g.truncate()
+
+        new_stats = read_stats(new)[:8]
+        old_stats = read_stats(old)[:8] or (0, ) * len(new_stats)
+
+        total = sum(new_stats) - sum(old_stats)
+
+        stats = tuple(
+            round(100 * (value / total), 1)
+            for value in map(sub, new_stats, old_stats)
+        )
+
+        @collect
+        def user():
+            yield stats[0], "Percent", ()
+
+        @collect
+        def nice():
+            yield stats[1], "Percent", ()
+
+        @collect
+        def system():
+            yield stats[2], "Percent", ()
+
+        @collect
+        def idle():
+            yield stats[3], "Percent", ()
+
+        @collect
+        def blocked():
+            yield stats[4], "Percent", ()
+
+        @collect
+        def irq():
+            yield stats[5], "Percent", ()
+
+        @collect
+        def soft_irq():
+            yield stats[6], "Percent", ()
+
+        # Not all kernels provide this column.
+        if len(stats) > 7:
+            @collect
+            def steal():
+                yield stats[7], "Percent", ()
 
     @collect
     def network_connections():
@@ -386,16 +451,16 @@ def collect_metrics():
 
 # The following configuration is pulled automatically if not provided.
 security_token = None
-access_key = environ.get('AWS_ACCESS_KEY_ID') or request_access_key()
-secret_key = environ.get('AWS_SECRET_ACCESS_KEY') or request_secret_key()
-instance_id = environ.get('AWS_INSTANCE_ID') or request_instance_id()
-ami_id = environ.get('AWS_AMI_ID') or request_ami_id()
-region = environ.get('AWS_REGION') or request_region()
+access_key = os.environ.get('AWS_ACCESS_KEY_ID') or request_access_key()
+secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY') or request_secret_key()
+instance_id = os.environ.get('AWS_INSTANCE_ID') or request_instance_id()
+ami_id = os.environ.get('AWS_AMI_ID') or request_ami_id()
+region = os.environ.get('AWS_REGION') or request_region()
 
 
-def metrics(verbose):
+def metrics(statfile=None, verbose=False):
     verbose and log("collecting metrics ...", "info")
-    data = collect_metrics()
+    data = collect_metrics(statfile)
     verbose and log("%d metrics collected." % len(data), "info")
     dimensions = ('InstanceId', instance_id), ('ImageId', ami_id)
     for dimension in dimensions:
@@ -405,7 +470,7 @@ def metrics(verbose):
         submit_metrics(data, dimension)
 
 
-def snapshot(verbose):
+def snapshot(verbose=False):
     verbose and log("getting list of logically attached volumes ...", "info")
     data = ec2("DescribeVolumes")
 
@@ -433,17 +498,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='store_true')
     commands = parser.add_subparsers()
-    commands.add_parser('metrics', help='report system metrics').set_defaults(
-        func=metrics
-    )
+    metrics_parser = commands.add_parser('metrics', help='report system metrics')
+    metrics_parser.set_defaults(func=metrics)
+    metrics_parser.add_argument('statfile', nargs='?', default=None)
     commands.add_parser('snapshot', help='create snapshot').set_defaults(
         func=snapshot
     )
 
     args = parser.parse_args()
-    args.verbose and log("command '%s' ..." % args.func.__name__, "info")
+    data = args.__dict__
+    func = data.pop('func')
+    args.verbose and log("command '%s' ..." % func.__name__, "info")
     try:
-        args.func(args.verbose)
+        func(**data)
     except BaseException:
         log(traceback.format_exc())
         raise SystemExit(1)

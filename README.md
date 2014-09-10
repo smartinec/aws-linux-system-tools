@@ -28,7 +28,7 @@ System Metrics
 The ``metrics`` command posts system metrics to `AWS CloudWatch
 <https://aws.amazon.com/cloudwatch/>`_:
 
-    $ python aws-system-tools.py metrics
+    $ python aws-system-tools.py metrics /tmp/stats
 
 Metrics:
 
@@ -36,6 +36,19 @@ Metrics:
   - DiskSpaceUtilization
   - LoadAverage
   - NetworkConnections
+
+If the ``statfile`` argument is provided, an additional set of metrics
+are reported:
+
+  - User:    Normal processes executing in user mode
+  - Nice:    Niced processes executing in user mode
+  - System:  Processes executing in kernel mode
+  - Idle:    Twiddling thumbs
+  - Blocked: Waiting for I/O to complete
+  - Irq:     Servicing interrupts
+  - SoftIrq: Servicing softirqs
+  - Steal:   Virtual CPU steal
+
 
 Each metric is reported with respect to both the instance id and the
 image id, the latter providing aggregate numbers for all instances
