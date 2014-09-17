@@ -19,6 +19,7 @@
 import os
 import re
 import argparse
+import platform
 import traceback
 
 from operator import sub
@@ -40,10 +41,16 @@ except ImportError:
     from urllib.parse import urlencode
 
 
+user_agent = 'aws-system-tools/1.0 Python/%s %s/%s' % (
+    platform.python_version(),
+    platform.system(),
+    platform.release()
+)
+
 aws_metadata_host = "169.254.169.254"
 canonical_date_format = "%Y%m%d"
 canonical_time_format = "%Y%m%dT%H%M%SZ"
-encoding = "utf-8"
+encoding = "UTF-8"
 method = "POST"
 path = "/"
 auth_type = "aws4_request"
@@ -105,19 +112,25 @@ def camelcase(name):
 
 
 def get_canonical(body, headers):
-    digest = get_digest(body)
     items = [method, path, ""]
 
     names = []
+    canonical_headers = []
     for name, value in sorted(headers.items()):
-        name = name.lower()
-        items.append("%s:%s" % (name, value))
-        names.append(name)
+        name = name.lower().strip()
+        if name.startswith('x-amz') or name == 'host':
+            canonical_headers.append(
+                "%s:%s" % (name, ' '.join(value.strip().split(' ')))
+            )
+            names.append(name)
 
     signed_headers = ";".join(names)
 
+    items.append("\n".join(canonical_headers))
     items.append("")
     items.append(signed_headers)
+
+    digest = get_digest(body)
     items.append(digest)
 
     return "\n".join(items), signed_headers
@@ -154,18 +167,18 @@ def make_request(service, body):
     conn = get_secure_connection(host, timeout=5)
 
     headers = {
-        "Content-type": "application/x-www-form-urlencoded; charset=%s" % (
+        "Content-Type": "application/x-www-form-urlencoded; charset=%s" % (
             encoding,
         ),
+        "Content-Length": str(len(body)),
         "Host": host,
-        "X-amz-date": now.strftime(canonical_time_format),
+        "X-Amz-Date": now.strftime(canonical_time_format),
     }
 
     if security_token is not None:
-        headers["X-amz-security-token"] = security_token
+        headers["X-Amz-Security-Token"] = security_token
 
     canonical, signed_headers = get_canonical(body, headers)
-
     signature = get_signature(
         now.strftime(canonical_date_format),
         region,
@@ -175,7 +188,8 @@ def make_request(service, body):
     )
 
     headers.update({
-        "Authorization": "AWS4-HMAC-SHA256 " + ", ".join((
+        "User-Agent": user_agent,
+        "Authorization": "AWS4-HMAC-SHA256 " + ",".join((
             "Credential=%s" % "/".join((
                 access_key,
                 now.strftime(canonical_date_format),
