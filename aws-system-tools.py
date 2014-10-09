@@ -29,6 +29,7 @@ from hmac import new as hmac
 from datetime import datetime
 from hashlib import sha256
 from binascii import hexlify
+from xml.etree import ElementTree
 
 try:
     from httplib import HTTPConnection, HTTPSConnection
@@ -147,7 +148,7 @@ def get_string_to_sign(service, canonical):
         now.strftime(canonical_time_format),
         "/".join((
             now.strftime(canonical_date_format),
-            region,
+            g['AWS_REGION'],
             service,
             auth_type,
         )),
@@ -156,14 +157,14 @@ def get_string_to_sign(service, canonical):
 
 
 def get_signature(*args):
-    s = bytes("AWS4" + secret_key)
+    s = bytes("AWS4" + g['AWS_SECRET_ACCESS_KEY'])
     for arg in args:
         s = hmac(s, bytes(arg), digestmod=sha256).digest()
     return str(hexlify(s))
 
 
 def make_request(service, body):
-    host = "%s.%s.amazonaws.com" % (service, region)
+    host = "%s.%s.amazonaws.com" % (service, g['AWS_REGION'])
     conn = get_secure_connection(host, timeout=5)
 
     headers = {
@@ -181,7 +182,7 @@ def make_request(service, body):
     canonical, signed_headers = get_canonical(body, headers)
     signature = get_signature(
         now.strftime(canonical_date_format),
-        region,
+        g['AWS_REGION'],
         service,
         auth_type,
         get_string_to_sign(service, canonical),
@@ -191,9 +192,9 @@ def make_request(service, body):
         "User-Agent": user_agent,
         "Authorization": "AWS4-HMAC-SHA256 " + ",".join((
             "Credential=%s" % "/".join((
-                access_key,
+                g['AWS_ACCESS_KEY_ID'],
                 now.strftime(canonical_date_format),
-                region,
+                g['AWS_REGION'],
                 service,
                 auth_type,
             )),
@@ -210,6 +211,12 @@ def make_request(service, body):
         raise
 
     return get_response_body(r)
+
+
+def make_request_helper(name, action, params, version):
+    params = dict((camelcase(name), value) for (name, value) in params.items())
+    params.update({"Action": action, "Version": version})
+    return make_request(name, urlencode(params))
 
 
 def get_response_body(r):
@@ -304,9 +311,11 @@ def get_secure_connection(host, **options):
 
 
 def ec2(action, **params):
-    params = dict((camelcase(name), value) for (name, value) in params.items())
-    params.update({"Action": action, "Version": "2013-07-15"})
-    return make_request("ec2", urlencode(params))
+    return make_request_helper("ec2", action, params, "2013-07-15")
+
+
+def rds(action, **params):
+    return make_request_helper("rds", action, params, "2013-09-09")
 
 
 def read_stats(data):
@@ -459,20 +468,37 @@ def collect_metrics(statfile=None):
     return data
 
 
-# The following configuration is pulled automatically if not provided.
+class Config(object):
+    def __init__(self, verbosity):
+        self.verbosity = verbosity
+        self.__dict__.update(os.environ)
+
+    def add(self, key, f):
+        setattr(self, "_" + key, f)
+
+    def __getitem__(self, key):
+        d = self.__dict__
+
+        try:
+            value = d[key]
+        except KeyError:
+            f = d["_" + key]
+            if self.verbosity:
+                log("running '%s' ..." % f.__name__, "info")
+            value = f()
+            d[key] = value
+
+        return value
+
+
 security_token = None
-access_key = os.environ.get('AWS_ACCESS_KEY_ID') or request_access_key()
-secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY') or request_secret_key()
-instance_id = os.environ.get('AWS_INSTANCE_ID') or request_instance_id()
-ami_id = os.environ.get('AWS_AMI_ID') or request_ami_id()
-region = os.environ.get('AWS_REGION') or request_region()
 
 
 def metrics(statfile=None, verbose=False):
     verbose and log("collecting metrics ...", "info")
     data = collect_metrics(statfile)
     verbose and log("%d metrics collected." % len(data), "info")
-    dimensions = ('InstanceId', instance_id), ('ImageId', ami_id)
+    dimensions = ('InstanceId', g['AWS_INSTANCE_ID']), ('ImageId', g['AWS_AMI_ID'])
     for dimension in dimensions:
         verbose and log(
             "submit metrics for dimension '%s' ..." % dimension[0], "info"
@@ -484,8 +510,8 @@ def snapshot(verbose=False):
     verbose and log("getting list of logically attached volumes ...", "info")
     data = ec2("DescribeVolumes")
 
-    for volume_id, current_instance_id, dev in volumes_regex.findall(data):
-        if current_instance_id != instance_id:
+    for volume_id, instance_id, dev in volumes_regex.findall(data):
+        if instance_id != g['AWS_INSTANCE_ID']:
             continue
 
         verbose and log("volume %s attached to device: %s." % (
@@ -504,6 +530,72 @@ def snapshot(verbose=False):
                 log("snapshot %s created." % snapshot_id, "info")
 
 
+def rds_log_sync(path=None, verbose=False, **kwargs):
+    data = rds("DescribeDBLogFiles", **kwargs)
+    tree = ElementTree.fromstring(data)
+    ns = tree.tag[1:].split('}', 1)[0]
+    path = path or os.getcwd()
+    verbose and log("log path '%s'." % path, "info")
+
+    for details in tuple(tree.findall(".//{%s}DescribeDBLogFilesDetails" % ns)):
+        size = int(details.find('{%s}Size' % ns).text)
+        last_written = int(details.find('{%s}LastWritten' % ns).text) / 1000
+        date = datetime.utcfromtimestamp(last_written)
+        log_file_name = details.find('{%s}LogFileName' % ns).text
+        relative_path, filename = os.path.split(log_file_name)
+
+        verbose and log("log file '%s/%s' on %s (%d bytes)" % (
+            relative_path,
+            filename,
+            date.ctime(),
+            size
+        ), "info")
+
+        p = os.path.join(path, relative_path)
+        if not os.path.exists(p):
+            os.makedirs(p)
+            verbose and log("log path '%s' created." % p, "info")
+
+        dest = os.path.join(p, filename)
+        dest_marker = dest + ".marker"
+
+        if os.path.exists(dest_marker):
+            if os.path.getsize(dest) == size:
+                verbose and log("log file unchanged.", "info")
+                continue
+
+            with open(dest_marker, "rb") as f:
+                marker = f.read()
+
+            verbose and log("marker '%s'." % marker, "info")
+        else:
+            marker = '0'
+
+        data = rds(
+            "DownloadDBLogFilePortion",
+            log_file_name=log_file_name,
+            marker=marker,
+            number_of_lines=1000,
+            **kwargs
+        )
+
+        tree = ElementTree.fromstring(data)
+        marker = tree.find(".//{%s}Marker" % ns).text
+        with open(dest_marker, "wb") as f:
+            f.write(marker)
+            verbose and log("log marker '%s' written." % marker, "info")
+
+        body = tree.find(".//{%s}LogFileData" % ns).text
+        if body is None:
+            verbose and log("no data returned.")
+
+        with open(dest, "ab") as f:
+            f.write(body)
+            verbose and log("log data written (%d bytes)." % len(body), "info")
+
+        os.utime(dest, (last_written, last_written))
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='store_true')
@@ -514,11 +606,27 @@ if __name__ == '__main__':
     commands.add_parser('snapshot', help='create snapshot').set_defaults(
         func=snapshot
     )
+    rds_log_sync_parser = commands.add_parser('rds-log-sync', help='synchronize rds log files')
+    rds_log_sync_parser.add_argument('DBInstanceIdentifier', metavar='id')
+    rds_log_sync_parser.add_argument('path', nargs='?', type=os.path.abspath, metavar='id')
+    rds_log_sync_parser.add_argument('MaxRecords', metavar='limit', nargs='?', type=int, default=100)
+    rds_log_sync_parser.set_defaults(func=rds_log_sync)
 
     args = parser.parse_args()
     data = args.__dict__
     func = data.pop('func')
     args.verbose and log("command '%s' ..." % func.__name__, "info")
+
+    global g
+    g = Config(args.verbose)
+
+    # The following configuration is pulled from machine metadata if not provided.
+    g.add('AWS_ACCESS_KEY_ID', request_access_key)
+    g.add('AWS_SECRET_ACCESS_KEY', request_secret_key)
+    g.add('AWS_REGION', request_region)
+    g.add('AWS_INSTANCE_ID', request_instance_id)
+    g.add('AWS_AMI_ID', request_ami_id)
+
     try:
         func(**data)
     except BaseException:

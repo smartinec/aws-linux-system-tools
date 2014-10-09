@@ -60,3 +60,15 @@ The ``snapshot`` command requests an EBS snapshot of those volumes
 currently attached logically to the machine.
 
     $ python aws-system-tools.py snapshot
+
+
+RDS Log Sync
+------------
+
+The ``rds-log-sync`` command synchronizes log files from an RDS
+instance to a local directory.
+
+    $ python aws-system-tools.py rds-log-sync <db-instance-id> <path>
+
+The ``path`` argument is optional and defaults to the working
+directory.
