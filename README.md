@@ -72,3 +72,7 @@ instance to a local directory.
 
 The ``path`` argument is optional and defaults to the working
 directory.
+
+If ``--metrics`` is given then the script submits CloudWatch metrics
+with statistics on how frequently the script has run (without failure)
+and how much it has downloaded (number of requests, bytes and speed).

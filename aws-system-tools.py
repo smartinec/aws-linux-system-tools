@@ -24,6 +24,7 @@ import traceback
 
 from operator import sub
 from sys import stderr, version
+from time import time
 from json import loads
 from hmac import new as hmac
 from datetime import datetime
@@ -56,7 +57,6 @@ method = "POST"
 path = "/"
 auth_type = "aws4_request"
 now = datetime.utcnow()
-namespace = "System/Linux"
 camelcase_regex = re.compile(r'(?:^|_)([a-z])')
 meminfo_regex = re.compile(r'([A-Z][A-Za-z()_]+):\s+(\d+)(?: ([km]B))')
 snapshot_regex = re.compile(r'<snapshotId>(snap-[0-9a-f]+)</snapshotId>')
@@ -324,7 +324,7 @@ def read_stats(data):
     return tuple(map(float, filter(None, re.split('\s+', data)[1:])))
 
 
-def submit_metrics(data, *dimensions):
+def submit_metrics(data, namespace, *dimensions):
     query = {
         "Action": "PutMetricData",
         "Version": "2010-08-01",
@@ -468,6 +468,14 @@ def collect_metrics(statfile=None):
     return data
 
 
+def mean(values):
+    values = list(values)
+    if not values:
+        return 0.0
+
+    return sum(values) / float(len(values))
+
+
 class Config(object):
     def __init__(self, verbosity):
         self.verbosity = verbosity
@@ -503,7 +511,7 @@ def metrics(statfile=None, verbose=False):
         verbose and log(
             "submit metrics for dimension '%s' ..." % dimension[0], "info"
         )
-        submit_metrics(data, dimension)
+        submit_metrics(data, "System/Linux", dimension)
 
 
 def snapshot(verbose=False):
@@ -530,18 +538,20 @@ def snapshot(verbose=False):
                 log("snapshot %s created." % snapshot_id, "info")
 
 
-def rds_log_sync(path=None, verbose=False, **kwargs):
+def rds_log_sync(path=None, metrics=False, verbose=False, **kwargs):
     data = rds("DescribeDBLogFiles", **kwargs)
     tree = ElementTree.fromstring(data)
     ns = tree.tag[1:].split('}', 1)[0]
     path = path or os.getcwd()
     verbose and log("log path '%s'." % path, "info")
 
-    for details in tuple(tree.findall(".//{%s}DescribeDBLogFilesDetails" % ns)):
-        size = int(details.find('{%s}Size' % ns).text)
-        last_written = int(details.find('{%s}LastWritten' % ns).text) / 1000
+    details = tuple(tree.findall(".//{%s}DescribeDBLogFilesDetails" % ns))
+    downloads = []
+    for detail in details:
+        size = int(detail.find('{%s}Size' % ns).text)
+        last_written = int(detail.find('{%s}LastWritten' % ns).text) / 1000
         date = datetime.utcfromtimestamp(last_written)
-        log_file_name = details.find('{%s}LogFileName' % ns).text
+        log_file_name = detail.find('{%s}LogFileName' % ns).text
         relative_path, filename = os.path.split(log_file_name)
 
         verbose and log("log file '%s/%s' on %s (%d bytes)" % (
@@ -571,6 +581,7 @@ def rds_log_sync(path=None, verbose=False, **kwargs):
         else:
             marker = '0'
 
+        t = time()
         data = rds(
             "DownloadDBLogFilePortion",
             log_file_name=log_file_name,
@@ -578,6 +589,7 @@ def rds_log_sync(path=None, verbose=False, **kwargs):
             number_of_lines=1000,
             **kwargs
         )
+        t = time() - t
 
         tree = ElementTree.fromstring(data)
         marker = tree.find(".//{%s}Marker" % ns).text
@@ -589,28 +601,60 @@ def rds_log_sync(path=None, verbose=False, **kwargs):
         if body is None:
             verbose and log("no data returned.")
 
+        downloads.append((len(body), t))
+
         with open(dest, "ab") as f:
             f.write(body)
             verbose and log("log data written (%d bytes)." % len(body), "info")
 
         os.utime(dest, (last_written, last_written))
 
+    if metrics:
+        verbose and log("submitting metrics ...", "info")
+        d = (('DBInstanceId', kwargs['DBInstanceIdentifier']), )
+        submit_metrics((
+            ("DescribeDBLogFiles", (1, "Count", d)),
+            ("DownloadDBLogFilePortion", (len(downloads), "Count", d)),
+            ("DownloadDBLogFilePortion", (sum(d[0] for d in downloads), "Bytes", d)),
+            ("DownloadDBLogFilePortion", (
+                mean(d[0] / d[1] for d in downloads), "Bytes/Second", d
+            )),
+        ), "RDS/Logging")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--verbose', '-v', action='store_true')
     commands = parser.add_subparsers()
-    metrics_parser = commands.add_parser('metrics', help='report system metrics')
+
+    # Metrics
+    metrics_parser = commands.add_parser(
+        'metrics', help='report system metrics'
+    )
     metrics_parser.set_defaults(func=metrics)
     metrics_parser.add_argument('statfile', nargs='?', default=None)
+
+    # EBS Snapshot
     commands.add_parser('snapshot', help='create snapshot').set_defaults(
         func=snapshot
     )
-    rds_log_sync_parser = commands.add_parser('rds-log-sync', help='synchronize rds log files')
-    rds_log_sync_parser.add_argument('DBInstanceIdentifier', metavar='id')
-    rds_log_sync_parser.add_argument('path', nargs='?', type=os.path.abspath, metavar='id')
-    rds_log_sync_parser.add_argument('MaxRecords', metavar='limit', nargs='?', type=int, default=100)
+
+    # RDS Log Sync
+    rds_log_sync_parser = commands.add_parser(
+        'rds-log-sync', help='synchronize rds log files'
+    )
     rds_log_sync_parser.set_defaults(func=rds_log_sync)
+    rds_log_sync_parser.add_argument('DBInstanceIdentifier', metavar='id')
+    rds_log_sync_parser.add_argument(
+        'path', nargs='?', type=os.path.abspath, metavar='id'
+    )
+    rds_log_sync_parser.add_argument(
+        'MaxRecords', metavar='limit', nargs='?', type=int, default=100
+    )
+    rds_log_sync_parser.add_argument(
+        '-m', '--metrics', action='store_const', const=True, default=False,
+        help='report metrics'
+    )
 
     args = parser.parse_args()
     data = args.__dict__
@@ -620,7 +664,8 @@ if __name__ == '__main__':
     global g
     g = Config(args.verbose)
 
-    # The following configuration is pulled from machine metadata if not provided.
+    # The following configuration is pulled from machine metadata if
+    # not provided.
     g.add('AWS_ACCESS_KEY_ID', request_access_key)
     g.add('AWS_SECRET_ACCESS_KEY', request_secret_key)
     g.add('AWS_REGION', request_region)
