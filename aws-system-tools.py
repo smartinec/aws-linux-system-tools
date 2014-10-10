@@ -614,9 +614,9 @@ def rds_log_sync(path=None, metrics=False, verbose=False, **kwargs):
         d = (('DBInstanceId', kwargs['DBInstanceIdentifier']), )
         submit_metrics((
             ("DescribeDBLogFiles", (1, "Count", d)),
-            ("DownloadDBLogFilePortion", (len(downloads), "Count", d)),
-            ("DownloadDBLogFilePortion", (sum(d[0] for d in downloads), "Bytes", d)),
-            ("DownloadDBLogFilePortion", (
+            ("DownloadDBLogFilePortionCount", (len(downloads), "Count", d)),
+            ("DownloadDBLogFilePortionSize", (sum(d[0] for d in downloads), "Bytes", d)),
+            ("DownloadDBLogFilePortionThroughput", (
                 mean(d[0] / d[1] for d in downloads), "Bytes/Second", d
             )),
         ), "RDS/Logging")
