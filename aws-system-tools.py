@@ -389,6 +389,9 @@ def collect_metrics(statfile=None):
                 device, path, filesystem, options = line.split(' ', 3)
                 result = os.statvfs(path)
 
+                if result.f_blocks == 0:
+                    continue
+
                 free = result.f_bfree / float(result.f_blocks)
                 yield round(100 * (1 - free), 1), "Percent", (
                     ("Filesystem", filesystem),
