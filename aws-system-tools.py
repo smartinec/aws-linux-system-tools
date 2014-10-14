@@ -405,7 +405,7 @@ def collect_metrics(statfile=None):
     if statfile is not None:
         with open('/proc/stat') as f:
             new = f.readline()
-        
+
         with touchopen(statfile, 'r+') as g:
             old = g.readline()
 
