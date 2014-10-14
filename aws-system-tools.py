@@ -394,8 +394,10 @@ def collect_metrics(statfile=None):
             yield round(100 * load, 1), "Percent", ()
 
     if statfile is not None:
-        with open('/proc/stat') as f, touchopen(statfile, 'r+') as g:
+        with open('/proc/stat') as f:
             new = f.readline()
+        
+        with touchopen(statfile, 'r+') as g:
             old = g.readline()
 
             g.seek(0)
