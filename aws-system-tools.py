@@ -403,7 +403,7 @@ def collect_metrics(statfile=None):
         with open('/proc/loadavg') as f:
             line = f.read()
             load = float(line.split(' ', 1)[0])
-            yield round(100 * load, 1), "Percent", ()
+            yield load, "Count", ()
 
     if statfile is not None:
         with open('/proc/stat') as f:
