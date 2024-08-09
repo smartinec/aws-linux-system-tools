@@ -176,8 +176,10 @@ def make_request(service, body):
         "X-Amz-Date": now.strftime(canonical_time_format),
     }
 
-    if security_token is not None:
-        headers["X-Amz-Security-Token"] = security_token
+    try:
+        headers["X-Amz-Security-Token"] = g['AWS_SECURITY_TOKEN']
+    except KeyError:
+        pass
 
     canonical, signed_headers = get_canonical(body, headers)
     signature = get_signature(
@@ -254,8 +256,7 @@ def request_secret_key():
     try:
         return request_security_credential('SecretAccessKey')
     finally:
-        global security_token
-        security_token = request_security_credential('Token')
+        g['AWS_SECURITY_TOKEN'] = request_security_credential('Token')
 
 
 def request_security_credential(key):
@@ -403,7 +404,7 @@ def collect_metrics(statfile=None):
         with open('/proc/loadavg') as f:
             line = f.read()
             load = float(line.split(' ', 1)[0])
-            yield load, "Count", ()
+            yield round(load, 2), "Count", ()
 
     if statfile is not None:
         with open('/proc/stat') as f:
@@ -486,7 +487,17 @@ class Config(object):
         self.verbosity = verbosity
         self.__dict__.update(os.environ)
 
-    def add(self, key, f):
+    def add(self, key, f, lazy=True):
+        if hasattr(self, key):
+            return
+
+        if not lazy:
+            if self.verbosity:
+                log("running '%s' ..." % f.__name__, "info")
+            value = f()
+            setattr(self, key, value)
+            return value
+
         setattr(self, "_" + key, f)
 
     def __getitem__(self, key):
@@ -495,16 +506,12 @@ class Config(object):
         try:
             value = d[key]
         except KeyError:
-            f = d["_" + key]
-            if self.verbosity:
-                log("running '%s' ..." % f.__name__, "info")
-            value = f()
-            d[key] = value
+            value = self.add(key, d["_" + key], False)
 
         return value
 
-
-security_token = None
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
 
 
 def metrics(statfile=None, verbose=False):
@@ -663,7 +670,10 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     data = args.__dict__
-    func = data.pop('func')
+    func = data.pop('func', None)
+    if func is None:
+        parser.print_usage()
+        raise SystemExit(0)
     args.verbose and log("command '%s' ..." % func.__name__, "info")
 
     global g
@@ -671,8 +681,8 @@ if __name__ == '__main__':
 
     # The following configuration is pulled from machine metadata if
     # not provided.
-    g.add('AWS_ACCESS_KEY_ID', request_access_key)
-    g.add('AWS_SECRET_ACCESS_KEY', request_secret_key)
+    g.add('AWS_ACCESS_KEY_ID', request_access_key, False)
+    g.add('AWS_SECRET_ACCESS_KEY', request_secret_key, False)
     g.add('AWS_REGION', request_region)
     g.add('AWS_INSTANCE_ID', request_instance_id)
     g.add('AWS_AMI_ID', request_ami_id)
